@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"io/fs"
 	"math/rand"
 	"strings"
 	"sync"
@@ -339,7 +338,7 @@ func TestIoRead(t *testing.T) {
 	assert.Equal(t, reader.String(), paragraph)
 	assert.Equal(t, int64(len(paragraph)), r.GetReadedBytes())
 	assert.Equal(t, int64(len(paragraph)), w.GetWrittenBytes())
-	assert.Equal(t, int64(len(paragraph)), r.f.readeroff)
+	assert.Equal(t, int64(len(paragraph)), r.readoff) // fork: sequential offset lives on PipeReaderAt
 	assert.Equal(t, int64(len(paragraph)), r.f.endln)
 }
 
@@ -399,8 +398,9 @@ func TestWriteClose(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
+	closeDone := make(chan error, 1) // fork: join the close goroutine, no leak
 	go func() {
-		w.Close()
+		closeDone <- w.Close()
 	}()
 	<-w.f.eow // used to detect that close is done except block on reader
 	b := []byte("hi")
@@ -411,6 +411,10 @@ func TestWriteClose(t *testing.T) {
 	n, err = r.ReadAt(b, 10)
 	assert.Equal(t, 0, n, "shouldn't have been able to read")
 	assert.Equal(t, io.EOF, err)
+	// fork: close the reader so the sync-mode writer Close can finish, and
+	// assert its result instead of leaking the goroutine + fd.
+	assert.NoError(t, r.Close())
+	assert.NoError(t, <-closeDone)
 }
 
 func TestWriteCloseWithError(t *testing.T) {
@@ -419,8 +423,10 @@ func TestWriteCloseWithError(t *testing.T) {
 		panic(err)
 	}
 	errTest := errors.New("test error")
+	closeDone := make(chan struct{}) // fork: join the close goroutine
 	go func() {
 		w.CloseWithError(errTest)
+		close(closeDone)
 	}()
 	<-w.f.eow // used to detect that close is done except block on reader
 	b := []byte("hi")
@@ -432,6 +438,7 @@ func TestWriteCloseWithError(t *testing.T) {
 	assert.Equal(t, 0, n, "shouldn't have been able to read")
 	assert.Equal(t, errTest, err)
 	r.Close()
+	<-closeDone
 }
 
 // same as above, but tests AsyncWriterPipe()
@@ -450,6 +457,7 @@ func TestAsyncWriteCloseWithError(t *testing.T) {
 	n, err = r.ReadAt(b, 10)
 	assert.Equal(t, 0, n)
 	assert.Equal(t, errTest, err)
+	r.Close() // fork: don't leak the fd
 }
 
 func TestPipeInDir(t *testing.T) {
@@ -546,8 +554,12 @@ func TestDoubleClose(t *testing.T) {
 	err = w.Close()
 	assert.NoError(t, err)
 
+	// fork divergence from upstream: reader Close is idempotent. Upstream
+	// double-closed the fd and returned fs.ErrClosed here; the fork closes it
+	// exactly once (sync.Once) and repeats the first result, so concurrent
+	// panic-recovery close paths never see a spurious error.
 	err = r.Close()
-	assert.ErrorIs(t, err, fs.ErrClosed)
+	assert.NoError(t, err)
 	err = w.Close()
 	assert.NoError(t, err)
 }
